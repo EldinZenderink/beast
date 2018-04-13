@@ -765,6 +765,7 @@ protected:
     boost::asio::strand<
         boost::asio::io_context::executor_type> strand_;
     boost::beast::flat_buffer buffer_;
+    bool activity_ = false;
 
 public:
     // Construct the session
@@ -781,12 +782,74 @@ public:
     {
     }
 
+    // Report a failure
+    void
+    fail(boost::system::error_code ec, char const* what)
+    {
+        std::cerr << what << ": " << ec.message() << "\n";
+
+        // Cancel the timer if it is active. Any pending wait will
+        // complete with the error boost::asio::operation_aborted.
+        timer_.cancel();
+
+    }
+
+    // Called when the timer expires.
+    void
+    start_timer()
+    {
+        // Set the expiration time
+        timer_.expires_after(std::chrono::seconds(15));
+
+        // Wait on the timer
+        timer_.async_wait(
+            boost::asio::bind_executor(
+                strand_,
+                std::bind(
+                    &http_session::on_timer,
+                    derived().shared_from_this(),
+                    std::placeholders::_1)));
+    }
+
+    // Called when the timer expires.
+    void
+    on_timer(boost::system::error_code ec)
+    {
+        // Happens when we cancel the timer
+        if(ec == boost::asio::error::operation_aborted)
+            return;
+
+        if(ec)
+            return fail(ec, "timer");
+
+        // If there was activity then set the timer again
+        if(activity_)
+        {
+            activity_ = false;
+
+            // Set the expiration time
+            timer_.expires_after(std::chrono::seconds(15));
+
+            // Wait on the timer again
+            return timer_.async_wait(
+                boost::asio::bind_executor(
+                    strand_,
+                    std::bind(
+                        &http_session::on_timer,
+                        derived().shared_from_this(),
+                        std::placeholders::_1)));
+        }
+
+        // If activity_ is `false` it means that we did not receive
+        // an HTTP request in the last 3 seconds. The derived class
+        // class handles the timeout because the behavior is a little
+        // bit different for SSL than it is for plain sessions.
+        derived().do_timeout();
+    }
+
     void
     do_read()
     {
-        // Set the timer
-        timer_.expires_after(std::chrono::seconds(15));
-
         // Make the request empty before reading,
         // otherwise the operation behavior is undefined.
         req_ = {};
@@ -803,50 +866,34 @@ public:
                     derived().shared_from_this(),
                     std::placeholders::_1)));
     }
-
-    // Called when the timer expires.
-    void
-    on_timer(boost::system::error_code ec)
-    {
-        if(ec && ec != boost::asio::error::operation_aborted)
-            return fail(ec, "timer");
-
-        // Verify that the timer really expired since the deadline may have moved.
-        if(timer_.expiry() <= std::chrono::steady_clock::now())
-            return derived().do_timeout();
-
-        // Wait on the timer
-        timer_.async_wait(
-            boost::asio::bind_executor(
-                strand_,
-                std::bind(
-                    &http_session::on_timer,
-                    derived().shared_from_this(),
-                    std::placeholders::_1)));
-    }
-
     void
     on_read(boost::system::error_code ec)
     {
-        // Happens when the timer closes the socket
+        // Happens when we close the socket on a timeout
         if(ec == boost::asio::error::operation_aborted)
             return;
 
-        // This means they closed the connection
+        // This means the other end closed the connection
         if(ec == http::error::end_of_stream)
             return derived().do_eof();
 
         if(ec)
             return fail(ec, "read");
 
-        // See if it is a WebSocket Upgrade
+        // See if we got a WebSocket Upgrade
         if(websocket::is_upgrade(req_))
         {
+            // Cancel the timer first
+            timer_.cancel();
+
             // Transfer the stream to a new WebSocket session
             return make_websocket_session(
                 derived().release_stream(),
                 std::move(req_));
         }
+
+        // Note that we have detected activity
+        activity_ = true;
 
         // Send the response
         handle_request(doc_root_, std::move(req_), queue_);
@@ -859,7 +906,7 @@ public:
     void
     on_write(boost::system::error_code ec, bool close)
     {
-        // Happens when the timer closes the socket
+        // Happens when we close the socket on a timeout
         if(ec == boost::asio::error::operation_aborted)
             return;
 
@@ -933,16 +980,19 @@ public:
                         &plain_http_session::run,
                         shared_from_this())));
 
-        // Run the timer. The timer is operated
-        // continuously, this simplifies the code.
-        on_timer({});
+        // Run the timer
+        start_timer();
 
+        // Read the first request
         do_read();
     }
 
     void
     do_eof()
     {
+        // Cancel the timer
+        timer_.cancel();
+
         // Send a TCP shutdown
         boost::system::error_code ec;
         socket_.shutdown(tcp::socket::shutdown_send, ec);
@@ -953,6 +1003,8 @@ public:
     void
     do_timeout()
     {
+        std::cerr << "Connection timed out" << std::endl;
+
         // Closing the socket cancels all outstanding operations. They
         // will complete with boost::asio::error::operation_aborted
         boost::system::error_code ec;
@@ -1014,12 +1066,8 @@ public:
                         &ssl_http_session::run,
                         shared_from_this())));
 
-        // Run the timer. The timer is operated
-        // continuously, this simplifies the code.
-        on_timer({});
-
-        // Set the timer
-        timer_.expires_after(std::chrono::seconds(15));
+        // Run the timer
+        start_timer();
 
         // Perform the SSL handshake
         // Note, this is the buffered version of the handshake.
@@ -1048,6 +1096,9 @@ public:
 
         // Consume the portion of the buffer used by the handshake
         buffer_.consume(bytes_used);
+
+        // Note that we have detected activity
+        activity_ = true;
 
         do_read();
     }
@@ -1088,12 +1139,14 @@ public:
     {
         // If this is true it means we timed out performing the shutdown
         if(eof_)
+        {
+            std::cerr << "Connection timed out" << std::endl;
             return;
+        }
 
-        // Start the timer again
-        timer_.expires_at(
-            (std::chrono::steady_clock::time_point::max)());
-        on_timer({});
+        // We timed out waiting for another HTTP request, so
+        // perform the SSL shutdown handshake.
+        start_timer();
         do_eof();
     }
 };
